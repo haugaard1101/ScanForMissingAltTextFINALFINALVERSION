@@ -1,65 +1,101 @@
+import os
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
-import torch
+from urllib.parse import urlparse, urljoin
 from PIL import Image
+from openai import OpenAI
 
 
+#skriv api nøgle her
+client = OpenAI(api_key="")
 
-#Boilerplate code from NLPConnect
-model = VisionEncoderDecoderModel.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
-feature_extractor = ViTImageProcessor.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
-tokenizer = AutoTokenizer.from_pretrained("nlpconnect/vit-gpt2-image-captioning")
+# Directory to save images
+DOWNLOAD_DIR = "static"
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
+# Create directory if it doesn't exist
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
 
-max_length = 16
-num_beams = 4
-gen_kwargs = {"max_length": max_length, "num_beams": num_beams}
 
-def generate_alt_text(image_paths):
-    images = []
-    for image_path in image_paths:
-        i_image = Image.open(image_path)
-        if i_image.mode != "RGB":
-            i_image = i_image.convert(mode="RGB")
-        images.append(i_image)
-
-    # Extract features from images
-    pixel_values = feature_extractor(images=images, return_tensors="pt").pixel_values
-    pixel_values = pixel_values.to(device)
-
-    # Generate alt text for the images
-    output_ids = model.generate(pixel_values, **gen_kwargs)
-    preds = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-    preds = [pred.strip() for pred in preds]
-    return preds
 
 def download_image(image_url):
-    # Download image from URL
-    response = requests.get(image_url)
-    image_name = image_url.split('/')[-1]
-    image_path = f"static/{image_name}"
-    with open(image_path, 'wb') as f:
-        f.write(response.content)
+    try:
 
-    # Generate alt text for the downloaded image
-    alt_text = generate_alt_text([image_path])[0]
-    return alt_text
+        #henter sidens indhold ned i et response object
+        response = requests.get(image_url)
+
+        #tjekker for error codes - 200 OK
+        response.raise_for_status()
+
+        #Splitter billedets filnavn og url(image.jpg)
+        image_name = image_url.split('/')[-1]
+
+        #vælger stien for hvor billedet skal gemmes: så C://.../static/image.jpg
+        image_path = os.path.join(DOWNLOAD_DIR, image_name)
+
+        #Gemmer vi billedet til den specifikke path - WB:write binary
+        with open(image_path, 'wb') as f:
+            f.write(response.content)
+        return image_path
+
+    except Exception as e:
+        print(f"Failed to download image {image_url}: {e}")
+        return None
+
+def gpt(image_url):
+    try:
+
+        #CHATGPT API
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Create a short alt text for the image and only use around 15 words?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url,
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=50,
+        )
+
+        # Udskriver imageURL og Response - hvilket er objektet
+        print(f"Full response for image {image_url}:", response)
+
+        #ChatGPT returnere et response array som vi hopper ned igennem. VI får til sidst fat i content som er selve AI beskrivelsen
+        #Response objekt nedenunder
+        #ChatCompletion(id='chatcmpl-9c7sYrpxPWxdmobdEXjO2DOaNvf6Y', choices=[Choice(finish_reason='stop', index=0, logprobs=None, message=ChatCompletionMessage(content='Blue house logo with a red window, text "FORSIKRINGSHUSET DANMARK" underneath.', role='assistant', function_call=None, tool_calls=None))],
+        alt_text = response.choices[0].message.content
+        return alt_text
+
+
+    except Exception as e:
+        print(f"An error occurred while calling ChatGPT API for image {image_url}: {e}")
+        return None
 
 def find_images_without_alt_text(url):
     image_list = []
     try:
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc
-
+        #Henter hele hjemmesiden ned med GET
         response = requests.get(url)
+        #print("response objekt: " + response)
+
+        #Tjekker for status kode 200 OK
+        response.raise_for_status()
+
+        #Henter alt html content som en string
         html_content = response.text
 
+        #html.parser gør så man kan navigere gennem htmlen
         soup = BeautifulSoup(html_content, 'html.parser')
 
+        #finder alle billeder der indeholder et img tag
         img_tags = soup.find_all('img')
 
         for img in img_tags:
@@ -68,17 +104,22 @@ def find_images_without_alt_text(url):
 
                 valid_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
                 if any(src.endswith(ext) for ext in valid_extensions):
-
                     if not src.startswith('http'):
-                        src = urlparse(url).scheme + '://' + urlparse(url).netloc + src
-                    alt_text = download_image(src)
-                    image_list.append({
-                        'src': src,
-                        'alt': "no alt text provided",
-                        'ai': alt_text
-                    })
+                        src = urljoin(url, src)
+
+                    #SRC = Billedet
+                    image_path = download_image(src)
+                    if image_path:
+                        # Generate alt text using GPT
+                        ai_alt_text = gpt(src)  # Call the gpt function with the image URL
+                        image_list.append({
+                            'src': src,
+                            'alt': "no alt text provided",
+                            'ai': ai_alt_text
+                        })
     except Exception as e:
-        print("An error occurred:", e)
+        print("An error occurred while processing the URL:", e)
 
     print("Images without alt text:", image_list)
     return image_list
+
